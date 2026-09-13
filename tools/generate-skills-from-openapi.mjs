@@ -24,21 +24,21 @@ if (args.length === 0 || args.includes('--help') || args.includes('-h')) {
   console.log('  --api-name <name>          API name (default: api)');
   console.log('  --output <dir>             Output directory (default: ./generated/<api-name>/)');
   console.log('  --price <micro-usdc>       Default price per skill (default: 1000)');
-  console.log('  --author-id <0x...>        Author agent ID (REQUIRED for --publish)');
-  console.log('  --author-name <name>       Author display name');
+  console.log('  --author-name <name>       Author display name (default: api-name)');
   console.log('  --max-endpoints <n>        Limit number of endpoints');
   console.log('  --include-tag <tag>        Only include endpoints with this tag');
   console.log('  --exclude-path <regex>     Exclude paths matching regex');
   console.log('');
-  console.log('Publishing options (Phase 2):');
+  console.log('Publishing options:');
   console.log('  --publish                  Auto-publish all generated SKILL.md to marketplace');
   console.log('  --publish-dry-run          Show what would be published, do not actually publish');
   console.log('  --publish-url <url>        Override API base URL (default: env AGENTSMARKET_URL or https://api.agentsmarket.world)');
   console.log('  --batch-size <n>           Concurrent publish requests (default: 5)');
   console.log('  --skip-on-error            Continue on individual publish errors');
   console.log('');
-  console.log('Auth: reads private key from ~/.config/agentsmarket/agent.key (created by `agentsmarket init`)');
-  console.log('      or AGENTSMARKET_PRIVATE_KEY env var');
+  console.log('Auth: server derives author identity from signature (ecrecover). No --author-id needed.');
+  console.log('      Reads private key from ~/.config/agentsmarket/agent.key (created by `agentsmarket init`)');
+  console.log('      or AGENTSMARKET_PRIVATE_KEY env var.');
   process.exit(0);
 }
 
@@ -61,7 +61,6 @@ for (let i = 1; i < args.length; i++) {
 
 const API_NAME = (OPTIONS['api-name'] || 'api').toLowerCase().replace(/[^a-z0-9-]/g, '-');
 const PRICE = parseInt(OPTIONS['price'] || '1000', 10);
-const AUTHOR_ID = OPTIONS['author-id'] || '0xPLACEHOLDER_REPLACE_WITH_YOUR_AGENT_ID';
 const AUTHOR_NAME = OPTIONS['author-name'] || API_NAME;
 const OUTPUT_DIR = OPTIONS['output'] || './generated/' + API_NAME;
 const MAX_ENDPOINTS = OPTIONS['max-endpoints'] ? parseInt(OPTIONS['max-endpoints'], 10) : Infinity;
@@ -72,6 +71,9 @@ const PUBLISH_DRY_RUN = !!OPTIONS['publish-dry-run'];
 const PUBLISH_URL = (OPTIONS['publish-url'] || process.env.AGENTSMARKET_URL || 'https://api.agentsmarket.world').replace(/\/$/, '');
 const BATCH_SIZE = parseInt(OPTIONS['batch-size'] || '5', 10);
 const SKIP_ON_ERROR = !!OPTIONS['skip-on-error'];
+
+// Resolved at runtime: placeholder for file-only generation, real address for publishing.
+let RESOLVED_AUTHOR_ID = '0xPLACEHOLDER_REPLACE_WITH_YOUR_AGENT_ID';
 
 // --- OpenAPI loading ---
 
@@ -131,7 +133,7 @@ function generateChildSkill(apiName, path, method, operation) {
     description: description,
     version: '1.0.0',
     author_name: AUTHOR_NAME,
-    author_id: AUTHOR_ID,
+    author_id: RESOLVED_AUTHOR_ID,
     author_contact: 'support@' + apiName.toLowerCase() + '.example',
     price_usdc: PRICE,
     is_free: PRICE === 0,
@@ -218,7 +220,7 @@ function generateParentSkill(apiName, children, childIds) {
     description: 'Router for ' + children.length + ' ' + apiName + ' API endpoints. Provide a natural-language task; this skill finds the right endpoint and returns its child skill_name + skill_id for invocation.',
     version: '1.0.0',
     author_name: AUTHOR_NAME,
-    author_id: AUTHOR_ID,
+    author_id: RESOLVED_AUTHOR_ID,
     author_contact: 'support@' + apiName.toLowerCase() + '.example',
     price_usdc: 0,
     is_free: true,
@@ -308,6 +310,11 @@ function getPrivateKey() {
     return readFileSync(keyPath, 'utf-8').trim();
   }
   return null;
+}
+
+// Replace author_id line in YAML frontmatter (handles quoted and unquoted forms).
+function replaceAuthorId(content, newAuthorId) {
+  return content.replace(/^author_id:.*$/m, `author_id: '${newAuthorId}'`);
 }
 
 // --- Authenticated publish ---
@@ -443,7 +450,7 @@ async function main() {
   if (PUBLISH_DRY_RUN) {
     console.log('\n=== DRY RUN SUMMARY ===');
     console.log('Would publish to: ' + PUBLISH_URL);
-    console.log('Author:            ' + AUTHOR_ID + ' (' + AUTHOR_NAME + ')');
+    console.log('Author:            ' + RESOLVED_AUTHOR_ID + ' (' + AUTHOR_NAME + ')');
     console.log('Children:          ' + children.length + ' (price: ' + PRICE + ' micro-USDC each)');
     console.log('Parent:            1 (price: 0, free)');
     console.log('Batch size:        ' + BATCH_SIZE + ' concurrent');
@@ -462,10 +469,6 @@ async function main() {
   // ===== Publishing flow =====
   console.log('\n=== Auto-publish mode ===\n');
 
-  if (AUTHOR_ID === '0xPLACEHOLDER_REPLACE_WITH_YOUR_AGENT_ID') {
-    throw new Error('Cannot publish: --author-id is required for --publish mode');
-  }
-
   const privateKey = getPrivateKey();
   if (!privateKey) {
     throw new Error(
@@ -475,17 +478,21 @@ async function main() {
     );
   }
 
-  const derivedAddress = addressFromPrivateKey(privateKey);
-  if (derivedAddress.toLowerCase() !== AUTHOR_ID.toLowerCase()) {
-    throw new Error(
-      `Private key does not match --author-id.\n` +
-      `  Private key derives: ${derivedAddress}\n` +
-      `  --author-id given:   ${AUTHOR_ID}\n` +
-      `Use the agent that owns address ${AUTHOR_ID}, or update --author-id to ${derivedAddress}`
-    );
-  }
+  // Derive author identity from private key — server uses ecrecover(signature)
+  // and would ignore any author_id we send in the body. We derive for:
+  //   1. Real address in frontmatter (so agents see who owns the SKILL)
+  //   2. Manifest accuracy
+  RESOLVED_AUTHOR_ID = addressFromPrivateKey(privateKey);
 
-  console.log('Author:  ' + AUTHOR_ID);
+  // Regenerate all SKILL.md content with real author_id, overwrite on disk
+  for (const child of children) {
+    child.content = replaceAuthorId(child.content, RESOLVED_AUTHOR_ID);
+    writeFileSync(OUTPUT_DIR + '/' + child.filename, child.content);
+  }
+  var parent = generateParentSkill(API_NAME, children);
+  writeFileSync(OUTPUT_DIR + '/' + parent.filename, parent.content);
+
+  console.log('Author:  ' + RESOLVED_AUTHOR_ID);
   console.log('URL:     ' + PUBLISH_URL);
   console.log('Price:   ' + PRICE + ' micro-USDC per child');
   console.log('Batch:   ' + BATCH_SIZE + ' concurrent');
@@ -548,7 +555,7 @@ async function main() {
     source: SOURCE,
     published_at: new Date().toISOString(),
     publish_url: PUBLISH_URL,
-    author_id: AUTHOR_ID,
+    author_id: RESOLVED_AUTHOR_ID,
     author_name: AUTHOR_NAME,
     parent_skill: {
       name: parentWithIds.name,
